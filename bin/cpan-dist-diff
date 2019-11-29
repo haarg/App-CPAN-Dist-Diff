@@ -1,0 +1,240 @@
+#!/usr/bin/env perl
+package App::CPAN::Dist::Diff;
+use strict;
+use warnings;
+
+use File::Find ();
+use File::Spec ();
+use File::Temp ();
+use JSON::PP ();
+use HTTP::Tiny ();
+use Cwd ();
+use Text::ParseWords ();
+
+sub git_config {
+  my ($var, $type) = @_;
+  $type = $type ? '--type='.$type : '';
+  my $val = `git config $type $var`;
+  chomp $val;
+  return length $val ? $val : undef;
+}
+
+sub which {
+  my $cmd = shift;
+  my $exe = `which "$cmd"`;
+  chomp $exe;
+  return -x $exe ? $exe : undef;
+}
+
+sub env_config {
+  my $config = {};
+  if (HTTP::Tiny->can('can_ssl') && HTTP::Tiny->can_ssl) {
+    $config->{get} = sub {
+      HTTP::Tiny->new->get(@_)->{content} || '';
+    };
+  }
+  elsif (my $curl = which('curl')) {
+    $config->{get} = sub {
+      open my $fh, '-|', $curl, '-L', '--', @_;
+      scalar do { local $/; <$fh> };
+    };
+  }
+  elsif (my $wget = which('wget')) {
+    $config->{get} = sub {
+      open my $fh, '-|', $wget, '-O', '-', '--', @_;
+      scalar do { local $/; <$fh> };
+    };
+  }
+
+  if (-t STDOUT) {
+    my $pager
+      = $ENV{GIT_PAGER}
+      || git_config('pager.diff')
+      || git_config('core.pager')
+      || $ENV{PAGER}
+      || 'less';
+    if (!File::Spec->file_name_is_absolute($pager)) {
+      $pager = which($pager);
+    }
+    if ($pager && -x $pager) {
+      $config->{pager} = $pager;
+    }
+  }
+
+  if ($config->{pager}) {
+    my $color_pager = git_config('color.pager', 'bool') || 'true';
+    if ($color_pager eq 'false') {
+      $config->{color} = 'false';
+    }
+  }
+  $config->{color}
+    ||= git_config('color.diff')
+    || git_config('color.ui')
+    || 'auto';
+
+  if ((git_config('diff.noprefix', 'bool')||'') eq 'true') {
+    $config->{cpan_prefix}  = '';
+    $config->{local_prefix} = '';
+  }
+  elsif ((git_config('diff.mnemonicPrefix')||'') eq 'true') {
+    $config->{cpan_prefix}  = 'c/';
+    $config->{local_prefix} = 'l/';
+  }
+  else {
+    $config->{cpan_prefix}  = 'a/';
+    $config->{local_prefix} = 'b/';
+  }
+  return $config;
+}
+
+sub build_dist {
+  if (-e 'dist.ini') {
+    die "can't build dzil dists yet!\n";
+  }
+  elsif (-e 'Build.PL') {
+    die "can't build Module::Build dists yet!\n";
+  }
+  if (-e 'Makefile.PL') {
+    if (-e 'Makefile') {
+      system 'make', 'Makefile';
+    }
+    else {
+      system "$^X", 'Makefile.PL'
+        or die "can't run Makefile.PL!\n";
+    }
+
+    system('make', 'manifest') == 0
+      or die "can't build manifest!\n";
+    system('make', 'distdir') == 0
+      or die "can't build dist!\n";
+
+    my $distvname;
+    my $distname;
+    open my $fh, '<', 'Makefile'
+      or die "can't read Makefile: $!\n";
+    while (my $line = <$fh>) {
+      if ($line =~ /^DISTVNAME\s*=\s*(.*)/) {
+        $distvname = $1;
+      }
+      elsif ($line =~ /^DISTNAME\s*=\s*(.*)/) {
+        $distname = $1;
+      }
+      last
+        if $distname && $distvname;
+    }
+    close $fh;
+
+    die "can't find build dir!"
+      unless $distvname && -d $distvname;
+
+    return ($distvname, $distname);
+  }
+}
+
+sub main {
+  my @args = @_;
+  my $config = env_config();
+  my $get = $config->{get};
+
+  my ($distdir, $dist) = @_;
+  if (!$distdir) {
+    ($distdir, my $name) = build_dist();
+    $dist ||= $name;
+  }
+  if (!$dist) {
+    open my $fh, '<', File::Spec->catfile($distdir, 'META.json')
+      or die "can't read META.json";
+    my $meta = eval { JSON::PP::decode_json(do { local $/; scalar <$fh> }) };
+    $dist = $meta->{name};
+  }
+
+  $distdir = File::Spec->canonpath($distdir);
+
+  my $download_url = eval {
+    JSON::PP::decode_json($get->('https://fastapi.metacpan.org/v1/release/'.$dist))->{download_url}
+  } or die "Unable to find download URL for $dist!\n";
+
+  my $file = $download_url;
+  $file =~ s{.*/}{};
+  my $tempdir = File::Temp->newdir('Distar-dist-diff-XXXXXX', TMPDIR => 1);
+
+  my $dist_file = File::Spec->canonpath(File::Spec->catfile($tempdir, $file));
+
+  {
+    open my $fh, '>:raw', $dist_file
+      or die "can't open $dist_file: $!";
+    print $fh $get->($download_url);
+    close $fh;
+  }
+
+  my @type
+    = $file =~ /\.gz$/  ? '-z'
+    : $file =~ /\.bz2$/ ? '-j'
+    : $file =~ /\.xz$/  ? '-J'
+    : ();
+
+  {
+    my $cwd = Cwd::cwd();
+    chdir $tempdir;
+    system('tar', '-x', @type, '-f', $dist_file) == 0
+        or die "Failed to extract $file!\n";
+    chdir $cwd;
+  }
+
+  opendir my $dh, $tempdir
+    or die "can't read $tempdir: $!\n";
+  my @extracted_dirs = grep +(-d && !/^\.\.?$/), readdir $dh;
+  closedir $dh;
+
+  die "$file archive did not extract to single directory!\n"
+    if @extracted_dirs != 1;
+
+  my $extracted_dir = File::Spec->canonpath(File::Spec->catdir($tempdir, $extracted_dirs[0]));
+
+  my $ansi_code = qr{\e\[[0-9;]*m};
+
+  my @git_cmd = qw(git diff --no-index);
+
+  if ($config->{color} eq 'always' || ($config->{color} eq 'auto' && -t STDOUT)) {
+    push @git_cmd, '--color';
+  }
+
+  my $out;
+  my $pager_pid;
+  if ($config->{pager}) {
+    local $ENV{LESS} ||= 'FRX';
+    local $ENV{LV}   ||= '-c';
+    $pager_pid = open $out, '|-', $config->{pager}
+      or $out = \*STDOUT;
+  }
+  else {
+    $out = \*STDOUT;
+  }
+
+  my $cpan_prefix = $config->{cpan_prefix};
+  my $local_prefix = $config->{local_prefix};
+
+  open my $fh, '-|', @git_cmd, '--', $extracted_dir, $distdir;
+  while (my $line = <$fh>) {
+    $line =~ s{^((?:${ansi_code})?diff --git )1(?:/?\Q$extracted_dir\E|/?\Q$distdir\E)/(.*? )2(?:/?\Q$extracted_dir\E|/?\Q$distdir\E)/}{${1}${cpan_prefix}${2}${local_prefix}};
+    $line =~ s{^((?:${ansi_code})?--- )1(?:/?\Q$extracted_dir\E/)}{${1}${cpan_prefix}};
+    $line =~ s{^((?:${ansi_code})?\+\+\+ )2(?:/?\Q$distdir\E/)}{${1}${local_prefix}};
+    print { $out } $line;
+  }
+
+  close $out
+    if $out != \*STDOUT;
+
+  waitpid $pager_pid, 0
+    if $pager_pid;
+}
+
+main(@ARGV);
+
+__END__
+
+=head1 NAME
+
+cpan-dist-diff
+
+=cut
