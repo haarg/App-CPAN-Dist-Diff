@@ -156,7 +156,7 @@ sub main {
 
   my $file = $download_url;
   $file =~ s{.*/}{};
-  my $tempdir = File::Temp->newdir('Distar-dist-diff-XXXXXX', TMPDIR => 1);
+  my $tempdir = File::Temp->newdir('cpan-dist-diff-XXXXXX', TMPDIR => 1);
 
   my $dist_file = File::Spec->canonpath(File::Spec->catfile($tempdir, $file));
 
